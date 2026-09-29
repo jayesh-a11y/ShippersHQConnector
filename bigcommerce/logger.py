@@ -28,7 +28,7 @@ class AppLogger:
         if name not in AppLogger._configured_names:
             self.logger.propagate = False
             formatter = logging.Formatter(
-                fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+                fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(filename)s:%(funcName)s:%(lineno)d | %(message)s",
                 datefmt="%Y-%m-%d %H:%M:%S",
             )
 
@@ -44,18 +44,33 @@ class AppLogger:
             self.logger.addHandler(file_handler)
 
             AppLogger._configured_names.add(name)
+            self.logger.debug(
+                f"Logger '{name}' configured: level={level}, file={Path(log_dir) / log_file}, "
+                f"max_bytes={max_bytes}, backup_count={backup_count}"
+            )
 
+    # stacklevel=2 makes %(filename)s/%(funcName)s/%(lineno)d report the caller, not this wrapper.
     def debug(self, msg, *args, **kwargs):
+        kwargs.setdefault("stacklevel", 2)
         self.logger.debug(msg, *args, **kwargs)
 
     def info(self, msg, *args, **kwargs):
+        kwargs.setdefault("stacklevel", 2)
         self.logger.info(msg, *args, **kwargs)
 
     def warning(self, msg, *args, **kwargs):
+        kwargs.setdefault("stacklevel", 2)
         self.logger.warning(msg, *args, **kwargs)
 
     def error(self, msg, *args, **kwargs):
+        kwargs.setdefault("stacklevel", 2)
         self.logger.error(msg, *args, **kwargs)
 
     def critical(self, msg, *args, **kwargs):
+        kwargs.setdefault("stacklevel", 2)
         self.logger.critical(msg, *args, **kwargs)
+
+    def exception(self, msg, *args, **kwargs):
+        """Log at ERROR level and include the current exception's traceback."""
+        kwargs.setdefault("stacklevel", 2)
+        self.logger.exception(msg, *args, **kwargs)

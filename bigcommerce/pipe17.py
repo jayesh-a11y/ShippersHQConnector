@@ -20,6 +20,7 @@ log = AppLogger(__name__)
 PIPE17_API_BASE_DEFAULT = "https://api-v3.pipe17.com/api/v3"
 REQUEST_TIMEOUT = 30
 MAX_RETRIES = 3
+REVIEW_REQUIRED = "reviewRequired"
 
 
 class Pipe17Client:
@@ -38,43 +39,72 @@ class Pipe17Client:
             "Content-Type": "application/json",
         })
 
-        log.debug("Initialized Pipe17 client")
+        log.debug(f"Initialized Pipe17 client (api_base={self.api_base}, timeout={REQUEST_TIMEOUT}s)")
 
     def _request(self, path, params=None, method="GET", json_body=None):
         url = f"{self.api_base}/{path.lstrip('/')}"
         for attempt in range(1, MAX_RETRIES + 1):
+            log.debug(f"{method} {url} params={params} body={json_body} (attempt {attempt}/{MAX_RETRIES})")
+            started = time.monotonic()
             try:
                 response = self.session.request(
                     method, url, params=params, json=json_body, timeout=REQUEST_TIMEOUT
                 )
             except requests.exceptions.RequestException as exc:
-                log.error(f"Network error calling Pipe17 API (attempt {attempt}/{MAX_RETRIES}): {exc}")
+                log.error(
+                    f"Network error calling Pipe17 API {method} {url} after {time.monotonic() - started:.2f}s "
+                    f"(attempt {attempt}/{MAX_RETRIES}): {type(exc).__name__}: {exc}"
+                )
                 if attempt == MAX_RETRIES:
+                    log.error(f"Giving up on Pipe17 {method} {url} after {MAX_RETRIES} attempts")
                     raise
+                log.debug(f"Retrying Pipe17 request in {2 ** attempt}s")
                 time.sleep(2 ** attempt)
                 continue
 
+            elapsed = time.monotonic() - started
+            log.debug(
+                f"Pipe17 {method} {url} responded {response.status_code} in {elapsed:.2f}s "
+                f"({len(response.content)} bytes)"
+            )
+
             if response.status_code == 429:
-                log.warning(f"Rate limited by Pipe17 API (attempt {attempt}/{MAX_RETRIES})")
+                log.warning(
+                    f"Rate limited by Pipe17 API on {method} {url}. Retrying in {2 ** attempt}s "
+                    f"(attempt {attempt}/{MAX_RETRIES})"
+                )
                 time.sleep(2 ** attempt)
                 continue
 
             if response.status_code in (401, 403):
-                log.critical(f"Pipe17 authentication failed ({response.status_code}). Check PIPE17_API_KEY.")
+                log.critical(
+                    f"Pipe17 authentication failed ({response.status_code}) on {method} {url}. "
+                    f"Check PIPE17_API_KEY. Body: {response.text[:500]}"
+                )
                 response.raise_for_status()
 
             if not response.ok:
-                log.error(f"Pipe17 API returned {response.status_code} for {url}: {response.text[:500]}")
+                log.error(
+                    f"Pipe17 API returned {response.status_code} for {method} {url} "
+                    f"(params={params}, body={json_body}): {response.text[:500]}"
+                )
                 response.raise_for_status()
 
             if response.status_code == 204 or not response.content:
+                log.debug(f"Pipe17 {method} {url} returned an empty body ({response.status_code})")
                 return {}
 
-            payload = response.json()
+            try:
+                payload = response.json()
+            except ValueError:
+                log.error(f"Pipe17 API returned non-JSON body for {method} {url}: {response.text[:500]}")
+                raise
             if not payload.get("success", True):
-                log.error(f"Pipe17 API reported failure for {url}: {payload}")
+                log.error(f"Pipe17 API reported failure for {method} {url}: {payload}")
+            log.debug(f"Pipe17 {method} {url} payload: {str(payload)[:2000]}")
             return payload
 
+        log.error(f"Exceeded {MAX_RETRIES} retries calling Pipe17 {method} {url}")
         raise RuntimeError("Exceeded max retries calling Pipe17 API.")
 
     def get_orders_by_ext_order_id(self, ext_order_id):
@@ -84,10 +114,16 @@ class Pipe17Client:
 
         while True:
             params = {"extOrderId": str(ext_order_id)}
+            log.debug(f"Order #{ext_order_id} | looking up Pipe17 orders by extOrderId (page {page_index})")
             payload = self._request("orders", params)
-            orders.extend(payload.get("orders") or [])
+            page_orders = payload.get("orders") or []
+            orders.extend(page_orders)
 
             pagination = payload.get("pagination") or {}
+            log.debug(
+                f"Order #{ext_order_id} | Pipe17 page {page_index}: {len(page_orders)} order(s), "
+                f"pagination={pagination}"
+            )
             if pagination.get("last", True) or page_index >= pagination.get("pages", page_index):
                 break
             page_index += 1
@@ -99,7 +135,10 @@ class Pipe17Client:
         """Return the single Pipe17 order for `ext_order_id`, or None if Pipe17 has no such order."""
         orders = self.get_orders_by_ext_order_id(ext_order_id)
         if len(orders) > 1:
-            log.warning(f"Order #{ext_order_id} | multiple Pipe17 orders matched; using the first one.")
+            log.warning(
+                f"Order #{ext_order_id} | {len(orders)} Pipe17 orders matched; using the first one. "
+                f"orderIds={[o.get('orderId') for o in orders]}"
+            )
         return orders[0] if orders else None
 
     def get_order_id_by_ext_order_id(self, ext_order_id):
@@ -117,6 +156,37 @@ class Pipe17Client:
         log.debug(f"Order #{ext_order_id} | Pipe17 orderId={order_id}")
         return order_id
 
+    def get_order(self, order_id):
+        """Return the Pipe17 order with internal id `order_id`, or None if it can't be retrieved."""
+        log.debug(f"Pipe17 order {order_id} | fetching order details")
+        try:
+            payload = self._request(f"orders/{order_id}")
+        except requests.exceptions.RequestException as exc:
+            log.error(f"Pipe17 order {order_id} | failed to fetch order: {type(exc).__name__}: {exc}")
+            return None
+
+        order = payload.get("order")
+        if not order:
+            log.error(
+                f"Pipe17 order {order_id} | response has no 'order': "
+                f"code={payload.get('code')} message='{payload.get('message')}'"
+            )
+            return None
+        return order
+
+    def is_order_status(self, order_id, expected_status=REVIEW_REQUIRED):
+        """Return True if the Pipe17 order `order_id` has status `expected_status` (e.g. "readyForFulfillment")."""
+        order = self.get_order(order_id)
+        if not order:
+            return False
+
+        status = order.get("status")
+        matches = status == expected_status
+        log.info(
+            f"Pipe17 order {order_id} | status='{status}', expected='{expected_status}', match={matches}"
+        )
+        return matches
+
     def update_order_custom_fields(self, order_id, carrier, carrier_code):
         """Set the "Carrier" and "Code" custom fields on the Pipe17 order with internal id `order_id`.
 
@@ -128,10 +198,11 @@ class Pipe17Client:
                 {"name": "Code", "value": carrier_code},
             ]
         }
+        log.info(f"Pipe17 order {order_id} | updating customFields Carrier='{carrier}' Code='{carrier_code}'")
         try:
             payload = self._request(f"orders/{order_id}", method="PUT", json_body=body)
         except requests.exceptions.RequestException as exc:
-            log.error(f"Pipe17 order {order_id} | failed to update customFields: {exc}")
+            log.error(f"Pipe17 order {order_id} | failed to update customFields: {type(exc).__name__}: {exc}")
             return False
 
         # An empty body (e.g. 204) means the PUT was accepted; otherwise trust the "success" flag.

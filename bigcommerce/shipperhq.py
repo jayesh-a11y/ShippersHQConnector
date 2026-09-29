@@ -123,10 +123,12 @@ class ShipperHQClient:
             "X-ShipperHQ-Scope":"LIVE"
         })
 
-        log.debug("Initialized ShipperHQ client")
+        log.debug(f"Initialized ShipperHQ client (api_base={self.api_base}, scope=LIVE, timeout={REQUEST_TIMEOUT}s)")
 
     def _graphql(self, query, variables=None):
         for attempt in range(1, MAX_RETRIES + 1):
+            log.debug(f"POST {self.api_base} (GraphQL) variables={variables} (attempt {attempt}/{MAX_RETRIES})")
+            started = time.monotonic()
             try:
                 response = self.session.post(
                     self.api_base,
@@ -134,14 +136,27 @@ class ShipperHQClient:
                     timeout=REQUEST_TIMEOUT,
                 )
             except requests.exceptions.RequestException as exc:
-                log.error(f"Network error calling ShipperHQ API (attempt {attempt}/{MAX_RETRIES}): {exc}")
+                log.error(
+                    f"Network error calling ShipperHQ API after {time.monotonic() - started:.2f}s "
+                    f"(attempt {attempt}/{MAX_RETRIES}, variables={variables}): {type(exc).__name__}: {exc}"
+                )
                 if attempt == MAX_RETRIES:
+                    log.error(f"Giving up on ShipperHQ API after {MAX_RETRIES} attempts (variables={variables})")
                     raise
+                log.debug(f"Retrying ShipperHQ request in {2 ** attempt}s")
                 time.sleep(2 ** attempt)
                 continue
 
+            elapsed = time.monotonic() - started
+            log.debug(
+                f"ShipperHQ responded {response.status_code} in {elapsed:.2f}s "
+                f"({len(response.content)} bytes, variables={variables})"
+            )
+
             if response.status_code == 429:
-                log.warning(f"Rate limited by ShipperHQ API (attempt {attempt}/{MAX_RETRIES})")
+                log.warning(
+                    f"Rate limited by ShipperHQ API. Retrying in {2 ** attempt}s (attempt {attempt}/{MAX_RETRIES})"
+                )
                 time.sleep(2 ** attempt)
                 continue
 
@@ -153,33 +168,52 @@ class ShipperHQClient:
                 log.error(f"ShipperHQ API returned {response.status_code}: {response.text[:500]}")
                 response.raise_for_status()
 
-            payload = response.json()
+            try:
+                payload = response.json()
+            except ValueError:
+                log.error(f"ShipperHQ API returned non-JSON body (status {response.status_code}): {response.text[:500]}")
+                raise
             if payload.get("errors"):
-                log.error(f"ShipperHQ API returned GraphQL errors: {payload['errors']}")
+                log.error(f"ShipperHQ API returned GraphQL errors for variables={variables}: {payload['errors']}")
+            log.debug(f"ShipperHQ GraphQL data for variables={variables}: {payload.get('data')}")
             return payload.get("data")
 
+        log.error(f"Exceeded {MAX_RETRIES} retries calling ShipperHQ API (variables={variables})")
         raise RuntimeError("Exceeded max retries calling ShipperHQ API.")
 
     def get_advanced_shipment(self, order_id):
         """Fetch ShipperHQ's Advanced Shipment details for the order, using order_id as the order number."""
+        log.debug(f"Order #{order_id} | fetching ShipperHQ advanced shipment")
         data = self._graphql(ADVANCED_SHIPMENT_QUERY, {"orderNumber": str(order_id)})
         order = (data or {}).get("viewOrder")
 
+        if not order:
+            log.warning(f"Order #{order_id} | ShipperHQ viewOrder returned no data (data={data})")
+
         assert(len(order) > 0 )
 
-        return order[0].get("shipments") if order else None
+        shipments = order[0].get("shipments") if order else None
+        if len(order) > 1:
+            log.warning(f"Order #{order_id} | ShipperHQ returned {len(order)} viewOrder entries; using the first one.")
+        log.debug(f"Order #{order_id} | ShipperHQ returned {len(shipments or [])} shipment(s)")
+        return shipments
 
 
 def find_shipment_by_detail_name(shipments: list, name: str = "World Wide Express 3PL"):
     """Return the first shipment whose shipmentDetail.name matches `name`, or None if not found."""
     if not shipments:
+        log.debug(f"No shipments to search for shipmentDetail.name='{name}'")
         return None
 
+    names = []
     for shipment in shipments:
         detail = shipment.get("shipmentDetail") or {}
+        names.append(detail.get("name"))
         if detail.get("name") == name:
+            log.debug(f"Found shipment id={shipment.get('id')} with shipmentDetail.name='{name}'")
             return shipment
 
+    log.info(f"No shipment with shipmentDetail.name='{name}' among {len(shipments)} shipment(s); names seen: {names}")
     return None
 
 
@@ -205,7 +239,11 @@ def get_carrier_code(shipment: dict):
     """
     carriers = (shipment or {}).get("carriers") or []
     if not carriers:
+        log.warning(f"Shipment id={(shipment or {}).get('id')} has no carriers; cannot determine carrier/method code")
         return None, None
+
+    if len(carriers) > 1:
+        log.debug(f"Shipment id={shipment.get('id')} has {len(carriers)} carriers; using the first one")
 
     carrier = carriers[0]
     carrier_code = (carrier.get("carrierDetail") or {}).get("carrierCode")
@@ -216,6 +254,12 @@ def get_carrier_code(shipment: dict):
         method_details = method_details[0] if method_details else {}
     method_code = method_details.get("methodCode")
 
+    if not methods:
+        log.warning(f"Shipment id={shipment.get('id')} carrier '{carrier_code}' has no methods")
+    log.debug(
+        f"Shipment id={shipment.get('id')} resolved carrierCode='{carrier_code}' methodCode='{method_code}' "
+        f"(methodTitle='{method_details.get('methodTitle')}')"
+    )
     return carrier_code, method_code
 
 
@@ -223,7 +267,7 @@ def map_to_wwex(carrier_code, method_code):
     """Return (wwex_carrier, wwex_carrier_code) for a ShipperHQ carrier/method, or (None, None) if unmapped."""
     carrier_mapping = WWEX_CARRIER_MAP.get(carrier_code)
     if carrier_mapping is None:
-        log.warning(f"No WWEX mapping for carrierCode='{carrier_code}'")
+        log.warning(f"No WWEX mapping for carrierCode='{carrier_code}' (known: {list(WWEX_CARRIER_MAP)})")
         return None, None
 
     wwex_carrier, methods = carrier_mapping
@@ -233,4 +277,8 @@ def map_to_wwex(carrier_code, method_code):
         return None, None
 
     numeric_code, _name = method
+    log.debug(
+        f"Mapped ShipperHQ carrierCode='{carrier_code}' methodCode='{method_code}' "
+        f"-> WWEX carrier='{wwex_carrier}' code='{numeric_code}' ({_name})"
+    )
     return wwex_carrier, numeric_code
